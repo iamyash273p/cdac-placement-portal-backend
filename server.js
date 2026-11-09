@@ -527,4 +527,17 @@ app.delete('/api/admin/drives/:id', (req, res) => {
   });
 });
 
+// --- ADMIN: END / COMPLETE DRIVE ENDPOINT ---
+app.put('/api/admin/drives/:id/complete', (req, res) => {
+  const driveId = req.params.id;
+  const query = `UPDATE drives SET status = 'Completed', drive_date = NULL WHERE id = ?`;
+
+  db.query(query, [driveId], (err, result) => {
+    if (err) {
+      return res.status(500).json({ success: false, message: err.message });
+    }
+    res.status(200).json({ success: true, message: 'Drive marked as completed and date cleared.' });
+  });
+});
+
 startServer();
