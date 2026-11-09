@@ -881,6 +881,19 @@ app.delete('/api/admin/drives/:id', (req, res) => {
     }
   });
 });
+//delete admin
+
+// --- ADMIN: DELETE ADMIN ---
+app.delete('/api/admin/admins/:id', (req, res) => {
+  const adminId = req.params.id;
+  db.query('DELETE FROM admins WHERE id = ?', [adminId], (err, result) => {
+    if (err) return res.status(500).json({ success: false, message: err.message });
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: 'Admin not found.' });
+    }
+    res.status(200).json({ success: true, message: 'Admin deleted successfully.' });
+  });
+});
 
 // --- ADMIN: END / COMPLETE DRIVE ENDPOINT ---
 app.put('/api/admin/drives/:id/complete', (req, res) => {
