@@ -1,23 +1,13 @@
 {
   "name": "cdac-placement-portal-backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "CDAC Placement Portal Express & MySQL Backend",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/iamyash273p/cdac-placement-portal-backend.git"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "type": "commonjs",
-  "bugs": {
-    "url": "https://github.com/iamyash273p/cdac-placement-portal-backend/issues"
-  },
-  "homepage": "https://github.com/iamyash273p/cdac-placement-portal-backend#readme",
   "dependencies": {
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
