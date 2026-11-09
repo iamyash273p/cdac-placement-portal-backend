@@ -30,17 +30,7 @@ function runQuery(connection, sql, params = []) {
 }
 
 function calculateInitialCalls(cmce, ccee) {
-  const mark1 = parseFloat(cmce);
-  const mark2 = parseFloat(ccee);
-  
-  if (isNaN(mark1) || isNaN(mark2) || (mark1 === 0 && mark2 === 0)) return '';
-  
-  const avg = (mark1 + mark2) / 2;
-
-  if (avg > 70) return '20 Calls';
-  if (avg >= 65 && avg <= 70) return '15 Calls';
-  if (avg >= 60 && avg < 65) return '10 Calls';
-  return '';
+  return '20 Calls';
 }
 
 async function startServer() {
@@ -94,7 +84,7 @@ async function startServer() {
       )`
     );
 
-    // 3. Drives Table
+    // 3. Drives Table (Clean schema without rounds)
     await runQuery(
       initConnection,
       `CREATE TABLE IF NOT EXISTS drives (
@@ -107,8 +97,6 @@ async function startServer() {
         passout_year INT DEFAULT 2026,
         criteria VARCHAR(255) DEFAULT '',
         status VARCHAR(30) DEFAULT 'Active',
-        rounds_completed INT DEFAULT 2,
-        total_rounds INT DEFAULT 3,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )`
     );
@@ -120,8 +108,6 @@ async function startServer() {
         id INT AUTO_INCREMENT PRIMARY KEY,
         drive_id INT NOT NULL,
         student_id INT NOT NULL,
-        rounds_completed INT DEFAULT 1,
-        total_rounds INT DEFAULT 3,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE KEY unique_drive_student (drive_id, student_id)
       )`
@@ -160,26 +146,16 @@ async function startServer() {
     const driveRows = await runQuery(initConnection, 'SELECT COUNT(*) AS count FROM drives');
     if (driveRows[0].count === 0) {
       const sampleDrives = [
-        ['TCS', 'Java Full Stack Developer', '7.0 LPA', 'Pune', '15 Nov 2026', 2026, '60% throughout academics', 'Shortlisted', 3, 3],
-        ['Infosys', 'Specialist Programmer', '9.5 LPA', 'Pune / Hyderabad', '18 Nov 2026', 2026, 'No active backlogs', 'Shortlisted', 2, 4],
-        ['Accenture', 'Advanced App Engineering Analyst', '6.5 LPA', 'Mumbai', '20 Nov 2026', 2026, '60% in Graduation', 'Shortlisted', 2, 3],
-        ['Siemens', 'R&D Software Engineer', '11.0 LPA', 'Bengaluru / Pune', '28 Nov 2026', 2026, '70% in Graduation', 'Shortlisted', 3, 4]
+        ['TCS', 'Java Full Stack Developer', '7.0 LPA', 'Pune', '15 Nov 2026', 2026, '60% throughout academics', 'Active'],
+        ['Infosys', 'Specialist Programmer', '9.5 LPA', 'Pune / Hyderabad', '18 Nov 2026', 2026, 'No active backlogs', 'Active'],
+        ['Accenture', 'Advanced App Engineering Analyst', '6.5 LPA', 'Mumbai', '20 Nov 2026', 2026, '60% in Graduation', 'Active'],
+        ['Siemens', 'R&D Software Engineer', '11.0 LPA', 'Bengaluru / Pune', '28 Nov 2026', 2026, '70% in Graduation', 'Active']
       ];
       await runQuery(
         initConnection,
-        'INSERT INTO drives (company, role, package, location, drive_date, passout_year, criteria, status, rounds_completed, total_rounds) VALUES ?',
+        'INSERT INTO drives (company, role, package, location, drive_date, passout_year, criteria, status) VALUES ?',
         [sampleDrives]
       );
-
-      const allStus = await runQuery(initConnection, 'SELECT id FROM students ORDER BY id ASC');
-      const allDrvs = await runQuery(initConnection, 'SELECT id FROM drives ORDER BY id ASC');
-      if (allStus.length > 0 && allDrvs.length >= 2) {
-        await runQuery(
-          initConnection,
-          'INSERT IGNORE INTO drive_shortlists (drive_id, student_id, rounds_completed, total_rounds) VALUES (?, ?, 2, 3), (?, ?, 3, 3)',
-          [allDrvs[0].id, allStus[0].id, allDrvs[1].id, allStus[0].id]
-        );
-      }
     }
 
     initConnection.end();
@@ -312,34 +288,41 @@ app.get('/api/drives', (req, res) => {
 // --- 6. SHORTLISTING ENDPOINTS ---
 app.get('/api/drives/:driveId/shortlist', (req, res) => {
   const driveId = req.params.driveId;
-  db.query('SELECT student_id, rounds_completed, total_rounds FROM drive_shortlists WHERE drive_id = ?', [driveId], (err, results) => {
+  db.query('SELECT student_id FROM drive_shortlists WHERE drive_id = ?', [driveId], (err, results) => {
     if (err) return res.status(500).json({ success: false, message: err.message });
     res.status(200).json({ success: true, shortlistedStudentIds: results.map((r) => r.student_id), records: results });
   });
 });
 
-app.post('/api/admin/drives/:driveId/shortlist', (req, res) => {
+app.post('/api/admin/drives/:driveId/shortlist', async (req, res) => {
   const driveId = Number(req.params.driveId);
   const { studentIds } = req.body;
 
   if (!Array.isArray(studentIds)) return res.status(400).json({ success: false, message: 'studentIds array is required.' });
 
-  db.query('DELETE FROM drive_shortlists WHERE drive_id = ?', [driveId], (delErr) => {
-    if (delErr) return res.status(500).json({ success: false, message: delErr.message });
-    if (studentIds.length === 0) return res.status(200).json({ success: true, message: 'Shortlist updated.' });
+  try {
+    await runQuery(db, 'DELETE FROM drive_shortlists WHERE drive_id = ?', [driveId]);
+    if (studentIds.length > 0) {
+      const values = studentIds.map((stuId) => [driveId, Number(stuId)]);
+      await runQuery(db, 'INSERT IGNORE INTO drive_shortlists (drive_id, student_id) VALUES ?', [values]);
+    }
 
-    const values = studentIds.map((stuId) => [driveId, Number(stuId), 2, 3]);
-    db.query('INSERT IGNORE INTO drive_shortlists (drive_id, student_id, rounds_completed, total_rounds) VALUES ?', [values], (insErr) => {
-      if (insErr) return res.status(500).json({ success: false, message: insErr.message });
-      res.status(200).json({ success: true, message: `Shortlisted ${studentIds.length} student(s).` });
-    });
-  });
+    // Automatically update calls_used for all students to match their total shortlists count
+    await runQuery(db, `
+      UPDATE students s
+      SET s.calls_used = (SELECT COUNT(*) FROM drive_shortlists ds WHERE ds.student_id = s.id)
+    `);
+
+    res.status(200).json({ success: true, message: 'Shortlist updated successfully.' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
 
 app.get('/api/student/shortlisted-drives', (req, res) => {
   const { studentId, email, prn } = req.query;
   let sql = `
-    SELECT d.*, ds.rounds_completed AS student_rounds_completed, ds.total_rounds AS student_total_rounds
+    SELECT d.*
     FROM drives d
     INNER JOIN drive_shortlists ds ON d.id = ds.drive_id
     INNER JOIN students s ON s.id = ds.student_id
@@ -361,11 +344,7 @@ app.get('/api/student/shortlisted-drives', (req, res) => {
     if (err) return res.status(500).json({ success: false, message: err.message });
     res.status(200).json({
       success: true,
-      drives: results.map((d) => ({
-        ...d, status: 'Shortlisted',
-        rounds_completed: d.student_rounds_completed ?? d.rounds_completed ?? 2,
-        total_rounds: d.student_total_rounds ?? d.total_rounds ?? 3
-      }))
+      drives: results.map((d) => ({ ...d, status: 'Shortlisted' }))
     });
   });
 });
@@ -412,6 +391,12 @@ app.post('/api/admin/students/bulk', async (req, res) => {
       const name = stu.name || stu.Name;
       const prn = stu.prn || stu.PRN;
       const email = stu.email || stu.Email || `${(prn || '').toLowerCase()}@cdac.in`;
+      
+      if (!name || !prn || !email || prn.toLowerCase() === 'prn' || email.toLowerCase() === 'email') {
+        errorCount++;
+        continue;
+      }
+
       const rawPassword = stu.password || stu.Password || 'student123';
       const phone = stu.phone || stu.Phone || '';
       const address = stu.address || stu.Address || '';
@@ -426,21 +411,25 @@ app.post('/api/admin/students/bulk', async (req, res) => {
       const status = stu.status || stu.Status || 'Unplaced';
       const company = stu.company || stu.Company || '-';
 
-      if (!name || !prn || !email) {
-        errorCount++;
-        continue;
-      }
-
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(rawPassword, salt);
       const assignedCalls = calculateInitialCalls(cmce, ccee);
-      const degreeFull = `${degree} ${postgrad ? '(PG: ' + postgrad + ')' : ''}`.trim();
+      const degreeFull = `${degree} ${postgrad && postgrad !== '-' ? '(PG: ' + postgrad + ')' : ''}`.trim();
 
       const query = `
         INSERT INTO students (name, prn, email, password, phone, address, passout_year, tenth_marks, twelfth_marks, degree_marks, cmce_marks, ccee_marks, calls, status, company)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON DUPLICATE KEY UPDATE 
-          name=VALUES(name), phone=VALUES(phone), status=VALUES(status), cmce_marks=VALUES(cmce_marks), ccee_marks=VALUES(ccee_marks), calls=VALUES(calls)
+          name = VALUES(name),
+          phone = VALUES(phone),
+          status = VALUES(status),
+          company = VALUES(company),
+          tenth_marks = VALUES(tenth_marks),
+          twelfth_marks = VALUES(twelfth_marks),
+          degree_marks = VALUES(degree_marks),
+          cmce_marks = VALUES(cmce_marks),
+          ccee_marks = VALUES(ccee_marks),
+          calls = VALUES(calls)
       `;
 
       await runQuery(db, query, [
@@ -450,6 +439,7 @@ app.post('/api/admin/students/bulk', async (req, res) => {
 
       successCount++;
     } catch (err) {
+      console.error('Bulk Import Row Error:', err.message);
       errorCount++;
     }
   }
@@ -462,9 +452,23 @@ app.post('/api/admin/students/bulk', async (req, res) => {
 
 // --- 9. ADMIN: CREATE DRIVE ---
 app.post('/api/admin/drives', (req, res) => {
-  const { company, role, package: pkg, location, drive_date, criteria, status, rounds_completed, total_rounds } = req.body;
-  const query = 'INSERT INTO drives (company, role, package, location, drive_date, criteria, status, rounds_completed, total_rounds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)';
-  db.query(query, [company, role, pkg, location, drive_date || '', 2026, criteria || '', status || 'Active', rounds_completed || 1, total_rounds || 3], (err) => {
+  const { company, role, package: pkg, location, drive_date, criteria } = req.body;
+
+  const query = `
+    INSERT INTO drives (company, role, package, location, drive_date, passout_year, criteria, status) 
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `;
+
+  db.query(query, [
+    company || 'Company', 
+    role || 'Role', 
+    pkg || '5.0 LPA', 
+    location || 'Pune', 
+    drive_date || '30 Nov 2026', 
+    2026, 
+    criteria || 'Standard CDAC criteria', 
+    'Active'
+  ], (err) => {
     if (err) return res.status(500).json({ success: false, message: err.message });
     res.status(201).json({ success: true, message: 'Drive created successfully.' });
   });
