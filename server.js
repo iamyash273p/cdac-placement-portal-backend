@@ -17,6 +17,13 @@ const DB_HOST = process.env.DB_HOST || 'localhost';
 const DB_USER = process.env.DB_USER || 'root';
 const DB_PASSWORD = process.env.DB_PASSWORD || '';
 const DB_NAME = process.env.DB_NAME || 'cdac_placement';
+const DRIVE_MARK_CRITERIA = [
+  { studentField: 'tenth_marks', driveField: 'min_tenth_marks' },
+  { studentField: 'twelfth_marks', driveField: 'min_twelfth_marks' },
+  { studentField: 'degree_marks', driveField: 'min_degree_marks' },
+  { studentField: 'cmce_marks', driveField: 'min_cmce_marks' },
+  { studentField: 'ccee_marks', driveField: 'min_ccee_marks' }
+];
 
 let db;
 
@@ -31,6 +38,105 @@ function runQuery(connection, sql, params = []) {
 
 function calculateInitialCalls(cmce, ccee) {
   return '20 Calls';
+}
+
+function parseStudentMark(value) {
+  const match = String(value ?? '').match(/^\s*(\d+(?:\.\d+)?)\s*(?=%|\s|$)/);
+  if (!match) return null;
+  const mark = Number(match[1]);
+  return mark >= 0 && mark <= 100 ? mark : null;
+}
+
+function isValidPercentage(value) {
+  if (value === null || value === undefined || value === '') return true;
+  if (typeof value === 'number') return Number.isFinite(value) && value >= 0 && value <= 100;
+  const text = String(value).trim();
+  if (!/^\d+(?:\.\d+)?\s*%?$/.test(text)) return false;
+  const mark = Number(text.replace('%', '').trim());
+  return Number.isFinite(mark) && mark >= 0 && mark <= 100;
+}
+
+function studentMeetsDriveCriteria(student, drive) {
+  if (String(student.status || '').toLowerCase() === 'placed') return false;
+
+  return DRIVE_MARK_CRITERIA.every(({ studentField, driveField }) => {
+    const minimum = drive[driveField];
+    if (minimum === null || minimum === undefined) return true;
+    const mark = parseStudentMark(student[studentField]);
+    return mark !== null && mark >= Number(minimum);
+  });
+}
+
+async function syncDriveShortlist(driveId) {
+  const [drive] = await runQuery(
+    db,
+    `SELECT status, deadline_date, shortlist_mode, ${DRIVE_MARK_CRITERIA.map(({ driveField }) => driveField).join(', ')}
+     FROM drives WHERE id = ?`,
+    [driveId]
+  );
+  if (!drive) throw new Error(`Drive ${driveId} was not found while updating its automatic shortlist.`);
+
+  if (String(drive.status).toLowerCase() === 'completed' ||
+    drive.shortlist_mode === 'manual' ||
+    (drive.deadline_date && drive.deadline_date < getTodayInIndia())) return;
+
+  const hasMinimums = DRIVE_MARK_CRITERIA.some(({ driveField }) =>
+    drive[driveField] !== null && drive[driveField] !== undefined
+  );
+  if (!hasMinimums) return;
+
+  const students = await runQuery(
+    db,
+    `SELECT id, status, ${DRIVE_MARK_CRITERIA.map(({ studentField }) => studentField).join(', ')}
+     FROM students`
+  );
+  const previouslyShortlistedPlacedStudents = await runQuery(
+    db,
+    `SELECT ds.student_id
+     FROM drive_shortlists ds
+     INNER JOIN students s ON s.id = ds.student_id
+     WHERE ds.drive_id = ? AND LOWER(TRIM(s.status)) = 'placed'`,
+    [driveId]
+  );
+  const shortlistStudentIds = new Set([
+    ...previouslyShortlistedPlacedStudents.map(({ student_id }) => Number(student_id)),
+    ...students
+      .filter((student) => studentMeetsDriveCriteria(student, drive))
+      .map((student) => Number(student.id))
+  ]);
+  const shortlistRows = [...shortlistStudentIds].map((studentId) => [driveId, studentId]);
+
+  await runQuery(db, 'DELETE FROM drive_shortlists WHERE drive_id = ?', [driveId]);
+  if (shortlistRows.length > 0) {
+    await runQuery(db, 'INSERT INTO drive_shortlists (drive_id, student_id) VALUES ?', [shortlistRows]);
+  }
+  await runQuery(db, `
+    UPDATE students s
+    SET s.calls_used = (SELECT COUNT(*) FROM drive_shortlists ds WHERE ds.student_id = s.id)
+  `);
+}
+
+async function syncAllAutomaticShortlists() {
+  const criteriaColumns = DRIVE_MARK_CRITERIA.map(({ driveField }) => driveField);
+  const configuredDrives = await runQuery(
+    db,
+    `SELECT id FROM drives
+     WHERE shortlist_mode = 'automatic'
+       AND (${criteriaColumns.map((column) => `${column} IS NOT NULL`).join(' OR ')})`
+  );
+  for (const drive of configuredDrives) {
+    await syncDriveShortlist(drive.id);
+  }
+}
+function getTodayInIndia() {
+  const dateParts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(new Date());
+  const dateValues = Object.fromEntries(dateParts.map(({ type, value }) => [type, value]));
+  return `${dateValues.year}-${dateValues.month}-${dateValues.day}`;
 }
 
 async function startServer() {
@@ -84,7 +190,7 @@ async function startServer() {
       )`
     );
 
-    // 3. Drives Table (Clean schema without rounds)
+    // 3. Drives Table
     await runQuery(
       initConnection,
       `CREATE TABLE IF NOT EXISTS drives (
@@ -93,13 +199,56 @@ async function startServer() {
         role VARCHAR(100) NOT NULL,
         package VARCHAR(50) NOT NULL,
         location VARCHAR(100) NOT NULL,
-        drive_date VARCHAR(50) NOT NULL,
+        drive_date VARCHAR(50) NULL,
+        deadline_date VARCHAR(10) NULL,
+        min_tenth_marks DECIMAL(6,2) NULL,
+        min_twelfth_marks DECIMAL(6,2) NULL,
+        min_degree_marks DECIMAL(6,2) NULL,
+        min_cmce_marks DECIMAL(6,2) NULL,
+        min_ccee_marks DECIMAL(6,2) NULL,
+        shortlist_mode VARCHAR(20) NOT NULL DEFAULT 'automatic',
         passout_year INT DEFAULT 2026,
         criteria VARCHAR(255) DEFAULT '',
         status VARCHAR(30) DEFAULT 'Active',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )`
     );
+
+    const deadlineColumn = await runQuery(
+      initConnection,
+      `SELECT COUNT(*) AS count
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'drives' AND COLUMN_NAME = 'deadline_date'`,
+      [DB_NAME]
+    );
+    if (deadlineColumn[0].count === 0) {
+      await runQuery(initConnection, 'ALTER TABLE drives ADD COLUMN deadline_date VARCHAR(10) NULL');
+    }
+    for (const { driveField } of DRIVE_MARK_CRITERIA) {
+      const column = await runQuery(
+        initConnection,
+        `SELECT COUNT(*) AS count
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'drives' AND COLUMN_NAME = ?`,
+        [DB_NAME, driveField]
+      );
+      if (column[0].count === 0) {
+        await runQuery(initConnection, `ALTER TABLE drives ADD COLUMN ${driveField} DECIMAL(6,2) NULL`);
+      }
+    }
+    const shortlistModeColumn = await runQuery(
+      initConnection,
+      `SELECT COUNT(*) AS count
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'drives' AND COLUMN_NAME = 'shortlist_mode'`,
+      [DB_NAME]
+    );
+    if (shortlistModeColumn[0].count === 0) {
+      await runQuery(
+        initConnection,
+        "ALTER TABLE drives ADD COLUMN shortlist_mode VARCHAR(20) NOT NULL DEFAULT 'automatic'"
+      );
+    }
 
     // 4. Drive Shortlists Table
     await runQuery(
@@ -211,17 +360,17 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// --- 2. LOGIN ENDPOINT ---
+// --- 2. LOGIN ENDPOINT (Supports both identifier & email/prn fields) ---
 app.post('/api/auth/login', (req, res) => {
-  const { email, prn, password } = req.body;
-  const identifier = (email || prn || '').trim();
+  const { identifier, email, prn, password } = req.body;
+  const loginInput = (identifier || email || prn || '').trim();
 
-  if (!identifier || !password) {
-    return res.status(400).json({ success: false, message: 'Email and password are required.' });
+  if (!loginInput || !password) {
+    return res.status(400).json({ success: false, message: 'Email/PRN and password are required.' });
   }
 
   const studentQuery = 'SELECT * FROM students WHERE email = ? OR prn = ?';
-  db.query(studentQuery, [identifier, identifier], async (err, results) => {
+  db.query(studentQuery, [loginInput, loginInput], async (err, results) => {
     if (err) return res.status(500).json({ success: false, message: 'Database error.' });
 
     if (results.length > 0) {
@@ -237,7 +386,7 @@ app.post('/api/auth/login', (req, res) => {
     }
 
     const adminQuery = 'SELECT * FROM admins WHERE email = ? OR name = ?';
-    db.query(adminQuery, [identifier, identifier], async (adminErr, adminResults) => {
+    db.query(adminQuery, [loginInput, loginInput], async (adminErr, adminResults) => {
       if (adminErr) return res.status(500).json({ success: false, message: 'Database error.' });
       if (adminResults.length === 0) return res.status(400).json({ success: false, message: 'Account not found.' });
 
@@ -256,7 +405,7 @@ app.post('/api/auth/login', (req, res) => {
 
 // --- 3. GET ALL STUDENTS ---
 app.get('/api/students', (req, res) => {
-  const query = 'SELECT id, name, prn, email, phone, address, passout_year, tenth_marks, twelfth_marks, degree_marks, cmce_marks, ccee_marks, calls, calls_used, status, company, photo, created_at FROM students ORDER BY id DESC';
+  const query = "SELECT id, name, prn, email, phone, address, passout_year, tenth_marks, twelfth_marks, degree_marks, cmce_marks, ccee_marks, calls, calls_used, status, company, photo, created_at, 'student' AS role FROM students ORDER BY id DESC";
   db.query(query, (err, results) => {
     if (err) return res.status(500).json({ success: false, message: 'Database error.' });
     res.status(200).json({ success: true, count: results.length, students: results });
@@ -265,7 +414,7 @@ app.get('/api/students', (req, res) => {
 
 // --- 4. GET ALL ADMINS ---
 app.get('/api/admins', (req, res) => {
-  db.query('SELECT id, name, email, phone, created_at FROM admins ORDER BY id DESC', (err, results) => {
+  db.query("SELECT id, name, email, phone, created_at, 'admin' AS role FROM admins ORDER BY id DESC", (err, results) => {
     if (err) return res.status(500).json({ success: false, message: err.message });
     res.status(200).json({ success: true, admins: results });
   });
@@ -279,10 +428,25 @@ app.get('/api/drives', (req, res) => {
     FROM drives d
     ORDER BY d.id DESC
   `;
-  db.query(query, (err, results) => {
-    if (err) return res.status(500).json({ success: false, message: 'Database error.' });
-    res.status(200).json({ success: true, drives: results });
-  });
+  db.query(
+    `UPDATE drives SET status = 'Completed'
+     WHERE deadline_date REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+       AND deadline_date < ?
+       AND status <> 'Completed'`,
+    [getTodayInIndia()],
+    (updateError) => {
+      if (updateError) return res.status(500).json({ success: false, message: updateError.message });
+      db.query(query, (err, results) => {
+        if (err) return res.status(500).json({ success: false, message: 'Database error.' });
+        res.status(200).json({
+          success: true,
+          drives: results.map((drive) => ({
+            ...drive,
+            status: String(drive.status).toLowerCase() === 'completed' ? 'Completed' : 'Ongoing'
+          }))
+        });
+      });
+    });
 });
 
 // --- 6. SHORTLISTING ENDPOINTS ---
@@ -298,16 +462,54 @@ app.post('/api/admin/drives/:driveId/shortlist', async (req, res) => {
   const driveId = Number(req.params.driveId);
   const { studentIds } = req.body;
 
-  if (!Array.isArray(studentIds)) return res.status(400).json({ success: false, message: 'studentIds array is required.' });
+  if (!Number.isInteger(driveId) || driveId <= 0 ||
+    !Array.isArray(studentIds) ||
+    studentIds.some((studentId) => !Number.isInteger(Number(studentId)) || Number(studentId) <= 0)) {
+    return res.status(400).json({ success: false, message: 'A valid drive ID and studentIds array are required.' });
+  }
 
   try {
-    await runQuery(db, 'DELETE FROM drive_shortlists WHERE drive_id = ?', [driveId]);
+    const [drive] = await runQuery(db, 'SELECT id FROM drives WHERE id = ?', [driveId]);
+    if (!drive) return res.status(404).json({ success: false, message: 'Drive not found.' });
+
     if (studentIds.length > 0) {
-      const values = studentIds.map((stuId) => [driveId, Number(stuId)]);
-      await runQuery(db, 'INSERT IGNORE INTO drive_shortlists (drive_id, student_id) VALUES ?', [values]);
+      const selectedStudents = await runQuery(
+        db,
+        'SELECT id, status FROM students WHERE id IN (?)',
+        [studentIds.map(Number)]
+      );
+      const placedStudents = selectedStudents.filter(
+        (student) => String(student.status || '').trim().toLowerCase() === 'placed'
+      );
+      if (placedStudents.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'Placed students cannot be added to a drive shortlist.',
+          ineligibleStudentIds: placedStudents.map((student) => student.id)
+        });
+      }
     }
 
-    // Automatically update calls_used for all students to match their total shortlists count
+    const previouslyShortlistedPlacedStudents = await runQuery(
+      db,
+      `SELECT ds.student_id
+       FROM drive_shortlists ds
+       INNER JOIN students s ON s.id = ds.student_id
+       WHERE ds.drive_id = ? AND LOWER(TRIM(s.status)) = 'placed'`,
+      [driveId]
+    );
+    const shortlistStudentIds = new Set([
+      ...previouslyShortlistedPlacedStudents.map(({ student_id }) => Number(student_id)),
+      ...studentIds.map(Number)
+    ]);
+
+    await runQuery(db, 'DELETE FROM drive_shortlists WHERE drive_id = ?', [driveId]);
+    if (shortlistStudentIds.size > 0) {
+      const values = [...shortlistStudentIds].map((studentId) => [driveId, studentId]);
+      await runQuery(db, 'INSERT IGNORE INTO drive_shortlists (drive_id, student_id) VALUES ?', [values]);
+    }
+    await runQuery(db, "UPDATE drives SET shortlist_mode = 'manual' WHERE id = ?", [driveId]);
+
     await runQuery(db, `
       UPDATE students s
       SET s.calls_used = (SELECT COUNT(*) FROM drive_shortlists ds WHERE ds.student_id = s.id)
@@ -322,21 +524,20 @@ app.post('/api/admin/drives/:driveId/shortlist', async (req, res) => {
 app.get('/api/student/shortlisted-drives', (req, res) => {
   const { studentId, email, prn } = req.query;
   let sql = `
-    SELECT d.*
+    SELECT DISTINCT d.*
     FROM drives d
     INNER JOIN drive_shortlists ds ON d.id = ds.drive_id
     INNER JOIN students s ON s.id = ds.student_id
+    WHERE LOWER(TRIM(s.status)) <> 'placed'
   `;
   const params = [];
 
   if (studentId) {
-    sql += ' WHERE s.id = ?'; params.push(Number(studentId));
+    sql += ' AND s.id = ?'; params.push(Number(studentId));
   } else if (email) {
-    sql += ' WHERE s.email = ?'; params.push(email);
+    sql += ' AND s.email = ?'; params.push(email);
   } else if (prn) {
-    sql += ' WHERE s.prn = ?'; params.push(prn);
-  } else {
-    sql = 'SELECT DISTINCT d.* FROM drives d INNER JOIN drive_shortlists ds ON d.id = ds.drive_id';
+    sql += ' AND s.prn = ?'; params.push(prn);
   }
 
   sql += ' ORDER BY d.id DESC';
@@ -352,6 +553,10 @@ app.get('/api/student/shortlisted-drives', (req, res) => {
 // --- 7. ADMIN: ADD STUDENT ---
 app.post('/api/admin/students', async (req, res) => {
   const { name, prn, email, password, phone, address, passout_year, tenthMarks, twelfthMarks, degreeMarks, cmceMarks, cceeMarks, status, company, photo } = req.body;
+  const marks = [tenthMarks, twelfthMarks, degreeMarks, cmceMarks, cceeMarks];
+  if (marks.some((mark) => !isValidPercentage(mark))) {
+    return res.status(400).json({ success: false, message: 'Student marks must be percentages between 0 and 100.' });
+  }
   try {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password || 'student123', salt);
@@ -363,12 +568,17 @@ app.post('/api/admin/students', async (req, res) => {
       name, prn, studentEmail, hashedPassword, phone || '', address || '', passout_year || 2026,
       tenthMarks || '', twelfthMarks || '', degreeMarks || '', cmceMarks || '', cceeMarks || '',
       assignedCalls, status || 'Unplaced', company || '-', photo || null
-    ], (err) => {
+    ], async (err) => {
       if (err) {
         if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ success: false, message: 'Student already exists.' });
         return res.status(500).json({ success: false, message: err.message });
       }
-      res.status(201).json({ success: true, message: 'Student added successfully.' });
+      try {
+        await syncAllAutomaticShortlists();
+        res.status(201).json({ success: true, message: 'Student added successfully.' });
+      } catch (syncError) {
+        res.status(500).json({ success: false, message: `Student was added, but automatic shortlists could not be updated: ${syncError.message}` });
+      }
     });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -410,6 +620,10 @@ app.post('/api/admin/students/bulk', async (req, res) => {
       const ccee = stu.ccee_marks || stu.CCEEMarks || '';
       const status = stu.status || stu.Status || 'Unplaced';
       const company = stu.company || stu.Company || '-';
+      if ([tenth, twelfth, degree, cmce, ccee].some((mark) => !isValidPercentage(mark))) {
+        errorCount++;
+        continue;
+      }
 
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(rawPassword, salt);
@@ -444,33 +658,142 @@ app.post('/api/admin/students/bulk', async (req, res) => {
     }
   }
 
-  res.status(200).json({
-    success: true,
-    message: `Bulk import completed. Successfully imported: ${successCount}, Failed/Skipped: ${errorCount}`
+  try {
+    await syncAllAutomaticShortlists();
+    res.status(200).json({
+      success: true,
+      message: `Bulk import completed. Successfully imported: ${successCount}, Failed/Skipped: ${errorCount}`
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: `Bulk import completed, but automatic shortlists could not be updated: ${err.message}`
+    });
+  }
+});
+
+const validateDriveFields = ({ company, role, package: pkg, location, drive_date, deadline_date, ...body }) => {
+  const validDate = (value) => {
+    if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    const date = new Date(`${value}T00:00:00.000Z`);
+    return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
+  };
+  const today = new Date().toISOString().slice(0, 10);
+
+  if (!company?.trim() || !role?.trim() || !location?.trim()) {
+    return 'Company, role, and location are required.';
+  }
+  if (typeof pkg !== 'number' || !Number.isFinite(pkg) || pkg <= 0 || !/^\d+(\.\d{1,2})?$/.test(String(pkg))) {
+    return 'Package must be a positive number with up to two decimal places.';
+  }
+  if (!validDate(drive_date) || drive_date < today) {
+    return 'Drive date must be today or a future date.';
+  }
+  if (!validDate(deadline_date) || deadline_date <= drive_date) {
+    return 'Application deadline must be after the drive date.';
+  }
+  for (const { driveField } of DRIVE_MARK_CRITERIA) {
+    const minimum = body[driveField];
+    if (!isValidPercentage(minimum)) {
+      return 'Minimum marks must be percentages between 0 and 100, or blank.';
+    }
+  }
+  return null;
+};
+
+// --- 9. ADMIN: CREATE AND UPDATE DRIVE ---
+app.post('/api/admin/drives', async (req, res) => {
+  const { company, role, package: pkg, location, drive_date, deadline_date, criteria } = req.body;
+  const validationError = validateDriveFields(req.body);
+  if (validationError) return res.status(400).json({ success: false, message: validationError });
+
+  try {
+    const columns = DRIVE_MARK_CRITERIA.map(({ driveField }) => driveField);
+    const values = DRIVE_MARK_CRITERIA.map(({ driveField }) => req.body[driveField] ?? null);
+    const result = await runQuery(db, `
+      INSERT INTO drives (company, role, package, location, drive_date, deadline_date, ${columns.join(', ')}, passout_year, criteria, status)
+      VALUES (?, ?, ?, ?, ?, ?, ${columns.map(() => '?').join(', ')}, ?, ?, ?)
+    `, [
+      company.trim(), role.trim(), pkg.toFixed(2), location.trim(), drive_date, deadline_date,
+      ...values, 2026, criteria || '', 'Ongoing'
+    ]);
+    await syncDriveShortlist(result.insertId);
+    res.status(201).json({ success: true, message: 'Drive created and eligible students shortlisted.' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.put('/api/admin/drives/:id', async (req, res) => {
+  const { company, role, package: pkg, location, drive_date, deadline_date, criteria } = req.body;
+  const validationError = validateDriveFields(req.body);
+  if (validationError) return res.status(400).json({ success: false, message: validationError });
+
+  try {
+    const criteriaColumns = DRIVE_MARK_CRITERIA.map(({ driveField }) => driveField);
+    const result = await runQuery(db, `
+      UPDATE drives
+      SET company = ?, role = ?, package = ?, location = ?, drive_date = ?, deadline_date = ?,
+          ${criteriaColumns.map((column) => `${column} = ?`).join(', ')}, criteria = ?
+      WHERE id = ?
+    `, [
+      company.trim(), role.trim(), pkg.toFixed(2), location.trim(), drive_date, deadline_date,
+      ...DRIVE_MARK_CRITERIA.map(({ driveField }) => req.body[driveField] ?? null),
+      criteria || '', req.params.id
+    ]);
+    if (result.affectedRows === 0) {
+      const rows = await runQuery(db, 'SELECT id FROM drives WHERE id = ?', [req.params.id]);
+      if (rows.length === 0) return res.status(404).json({ success: false, message: 'Drive not found.' });
+    }
+    await syncDriveShortlist(req.params.id);
+    res.status(200).json({ success: true, message: 'Drive updated and eligible students shortlisted.' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.put('/api/admin/drives/:id/status', (req, res) => {
+  const { status } = req.body;
+  if (!['Ongoing', 'Completed'].includes(status)) {
+    return res.status(400).json({ success: false, message: 'Status must be Ongoing or Completed.' });
+  }
+
+  db.query('SELECT deadline_date, status FROM drives WHERE id = ?', [req.params.id], (lookupError, rows) => {
+    if (lookupError) return res.status(500).json({ success: false, message: lookupError.message });
+    if (rows.length === 0) return res.status(404).json({ success: false, message: 'Drive not found.' });
+
+    const { deadline_date: deadline, status: currentStatus } = rows[0];
+    if (status === 'Ongoing' && String(currentStatus).toLowerCase() === 'completed') {
+      return res.status(409).json({ success: false, message: 'A completed drive cannot be reopened.' });
+    }
+    if (status === 'Ongoing' && deadline && deadline < getTodayInIndia()) {
+      return res.status(400).json({ success: false, message: 'A drive cannot be reopened after its application deadline.' });
+    }
+
+    db.query(
+      `UPDATE drives SET status = ? WHERE id = ? ${status === 'Ongoing' ? "AND status <> 'Completed'" : ''}`,
+      [status, req.params.id],
+      (updateError, result) => {
+      if (updateError) return res.status(500).json({ success: false, message: updateError.message });
+      if (status === 'Ongoing' && result.affectedRows === 0) {
+        return res.status(409).json({ success: false, message: 'A completed drive cannot be reopened.' });
+      }
+      res.status(200).json({ success: true, message: `Drive marked ${status.toLowerCase()}.` });
+      }
+    );
   });
 });
 
-// --- 9. ADMIN: CREATE DRIVE ---
-app.post('/api/admin/drives', (req, res) => {
-  const { company, role, package: pkg, location, drive_date, criteria } = req.body;
+// --- ADMIN: END / COMPLETE DRIVE ENDPOINT ---
+app.put('/api/admin/drives/:id/complete', (req, res) => {
+  const driveId = req.params.id;
+  const query = `UPDATE drives SET status = 'Completed' WHERE id = ?`;
 
-  const query = `
-    INSERT INTO drives (company, role, package, location, drive_date, passout_year, criteria, status) 
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `;
-
-  db.query(query, [
-    company || 'Company', 
-    role || 'Role', 
-    pkg || '5.0 LPA', 
-    location || 'Pune', 
-    drive_date || '30 Nov 2026', 
-    2026, 
-    criteria || 'Standard CDAC criteria', 
-    'Active'
-  ], (err) => {
-    if (err) return res.status(500).json({ success: false, message: err.message });
-    res.status(201).json({ success: true, message: 'Drive created successfully.' });
+  db.query(query, [driveId], (err) => {
+    if (err) {
+      return res.status(500).json({ success: false, message: err.message });
+    }
+    res.status(200).json({ success: true, message: 'Drive marked as completed.' });
   });
 });
 
@@ -497,14 +820,23 @@ app.post('/api/admin/create', async (req, res) => {
 app.put('/api/admin/students/:id', (req, res) => {
   const studentId = req.params.id;
   const { name, prn, email, phone, address, status, company, tenth_marks, twelfth_marks, degree_marks, cmce_marks, ccee_marks, calls } = req.body;
+  const marks = [tenth_marks, twelfth_marks, degree_marks, cmce_marks, ccee_marks];
+  if (marks.some((mark) => !isValidPercentage(mark))) {
+    return res.status(400).json({ success: false, message: 'Student marks must be percentages between 0 and 100.' });
+  }
 
   const calculatedCalls = calculateInitialCalls(cmce_marks, ccee_marks);
   const finalCalls = calls !== undefined && calls !== '' ? calls : calculatedCalls;
 
   const query = 'UPDATE students SET name = ?, prn = ?, email = ?, phone = ?, address = ?, status = ?, company = ?, tenth_marks = ?, twelfth_marks = ?, degree_marks = ?, cmce_marks = ?, ccee_marks = ?, calls = ? WHERE id = ?';
-  db.query(query, [name, prn, email, phone, address, status, company || '-', tenth_marks || '', twelfth_marks || '', degree_marks || '', cmce_marks || '', ccee_marks || '', finalCalls, studentId], (err) => {
+  db.query(query, [name, prn, email, phone, address, status, company || '-', tenth_marks || '', twelfth_marks || '', degree_marks || '', cmce_marks || '', ccee_marks || '', finalCalls, studentId], async (err) => {
     if (err) return res.status(500).json({ success: false, message: err.message });
-    res.status(200).json({ success: true, message: 'Student updated successfully.' });
+    try {
+      await syncAllAutomaticShortlists();
+      res.status(200).json({ success: true, message: 'Student updated successfully.' });
+    } catch (syncError) {
+      res.status(500).json({ success: false, message: `Student was updated, but automatic shortlists could not be refreshed: ${syncError.message}` });
+    }
   });
 });
 
@@ -519,11 +851,34 @@ app.delete('/api/admin/students/:id', (req, res) => {
 // --- 13. ADMIN: DELETE DRIVE ---
 app.delete('/api/admin/drives/:id', (req, res) => {
   const driveId = req.params.id;
-  db.query('DELETE FROM drive_shortlists WHERE drive_id = ?', [driveId], () => {
-    db.query('DELETE FROM drives WHERE id = ?', [driveId], (err) => {
-      if (err) return res.status(500).json({ success: false, message: err.message });
+  db.getConnection(async (connectionError, connection) => {
+    if (connectionError) return res.status(500).json({ success: false, message: connectionError.message });
+
+    try {
+      await new Promise((resolve, reject) => {
+        connection.beginTransaction((err) => err ? reject(err) : resolve());
+      });
+      const drives = await runQuery(connection, 'SELECT id FROM drives WHERE id = ?', [driveId]);
+      if (drives.length === 0) {
+        await new Promise((resolve) => connection.rollback(() => resolve()));
+        return res.status(404).json({ success: false, message: 'Drive not found.' });
+      }
+      await runQuery(connection, 'DELETE FROM drive_shortlists WHERE drive_id = ?', [driveId]);
+      await runQuery(connection, 'DELETE FROM drives WHERE id = ?', [driveId]);
+      await runQuery(connection, `
+        UPDATE students s
+        SET s.calls_used = (SELECT COUNT(*) FROM drive_shortlists ds WHERE ds.student_id = s.id)
+      `);
+      await new Promise((resolve, reject) => {
+        connection.commit((err) => err ? reject(err) : resolve());
+      });
       res.status(200).json({ success: true, message: 'Drive deleted successfully.' });
-    });
+    } catch (err) {
+      await new Promise((resolve) => connection.rollback(() => resolve()));
+      res.status(500).json({ success: false, message: err.message });
+    } finally {
+      connection.release();
+    }
   });
 });
 
