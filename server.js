@@ -56,8 +56,16 @@ function isValidPercentage(value) {
   return Number.isFinite(mark) && mark >= 0 && mark <= 100;
 }
 
+function isValidEmail(value) {
+  return typeof value === 'string' && /^[^\s@]+@[^\s@]+\.[A-Za-z]{2,}$/.test(value.trim());
+}
+
+function isValidPhone(value) {
+  return /^\d{10}$/.test(String(value ?? ''));
+}
+
 function studentMeetsDriveCriteria(student, drive) {
-  if (String(student.status || '').toLowerCase() === 'placed') return false;
+  if (String(student.status || '').trim().toLowerCase() === 'placed') return false;
 
   return DRIVE_MARK_CRITERIA.every(({ studentField, driveField }) => {
     const minimum = drive[driveField];
@@ -109,6 +117,11 @@ async function syncDriveShortlist(driveId) {
   await runQuery(db, 'DELETE FROM drive_shortlists WHERE drive_id = ?', [driveId]);
   if (shortlistRows.length > 0) {
     await runQuery(db, 'INSERT INTO drive_shortlists (drive_id, student_id) VALUES ?', [shortlistRows]);
+    await runQuery(
+      db,
+      'INSERT IGNORE INTO student_drive_calls (student_id, drive_id) VALUES ?',
+      [shortlistRows.map(([shortlistedDriveId, studentId]) => [studentId, shortlistedDriveId])]
+    );
   }
   await runQuery(db, `
     UPDATE students s
@@ -170,12 +183,27 @@ async function startServer() {
         ccee_marks VARCHAR(20) DEFAULT '',
         calls VARCHAR(50) DEFAULT '',
         calls_used INT DEFAULT 0,
+        calls_used_archived INT NOT NULL DEFAULT 0,
         status VARCHAR(30) DEFAULT 'Unplaced',
         company VARCHAR(100) DEFAULT '-',
         photo LONGTEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )`
     );
+
+    const archivedCallsColumn = await runQuery(
+      initConnection,
+      `SELECT COUNT(*) AS count
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'students' AND COLUMN_NAME = 'calls_used_archived'`,
+      [DB_NAME]
+    );
+    if (archivedCallsColumn[0].count === 0) {
+      await runQuery(
+        initConnection,
+        'ALTER TABLE students ADD COLUMN calls_used_archived INT NOT NULL DEFAULT 0'
+      );
+    }
 
     // 2. Admins Table
     await runQuery(
@@ -261,6 +289,33 @@ async function startServer() {
         UNIQUE KEY unique_drive_student (drive_id, student_id)
       )`
     );
+
+    await runQuery(
+      initConnection,
+      `CREATE TABLE IF NOT EXISTS student_drive_calls (
+        student_id INT NOT NULL,
+        drive_id INT NOT NULL,
+        PRIMARY KEY (student_id, drive_id)
+      )`
+    );
+    await runQuery(
+      initConnection,
+      `INSERT IGNORE INTO student_drive_calls (student_id, drive_id)
+       SELECT student_id, drive_id FROM drive_shortlists`
+    );
+
+    await runQuery(initConnection, `
+      INSERT IGNORE INTO drive_shortlists (drive_id, student_id)
+      SELECT dc.drive_id, dc.student_id
+      FROM student_drive_calls dc
+      INNER JOIN students s ON s.id = dc.student_id
+      INNER JOIN drives d ON d.id = dc.drive_id
+      WHERE LOWER(TRIM(s.status)) = 'placed'
+    `);
+    await runQuery(initConnection, `
+      UPDATE students s
+      SET s.calls_used = (SELECT COUNT(*) FROM drive_shortlists ds WHERE ds.student_id = s.id)
+    `);
 
     // Seed Default Admin if empty
     const adminRows = await runQuery(initConnection, 'SELECT COUNT(*) AS count FROM admins');
@@ -360,17 +415,17 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// --- 2. LOGIN ENDPOINT (Supports both identifier & email/prn fields) ---
+// --- 2. LOGIN ENDPOINT ---
 app.post('/api/auth/login', (req, res) => {
-  const { identifier, email, prn, password } = req.body;
-  const loginInput = (identifier || email || prn || '').trim();
+  const { email, password } = req.body;
+  const loginEmail = typeof email === 'string' ? email.trim() : '';
 
-  if (!loginInput || !password) {
-    return res.status(400).json({ success: false, message: 'Email/PRN and password are required.' });
+  if (!loginEmail || !password) {
+    return res.status(400).json({ success: false, message: 'Email and password are required.' });
   }
 
-  const studentQuery = 'SELECT * FROM students WHERE email = ? OR prn = ?';
-  db.query(studentQuery, [loginInput, loginInput], async (err, results) => {
+  const studentQuery = 'SELECT * FROM students WHERE email = ?';
+  db.query(studentQuery, [loginEmail], async (err, results) => {
     if (err) return res.status(500).json({ success: false, message: 'Database error.' });
 
     if (results.length > 0) {
@@ -385,8 +440,8 @@ app.post('/api/auth/login', (req, res) => {
       });
     }
 
-    const adminQuery = 'SELECT * FROM admins WHERE email = ? OR name = ?';
-    db.query(adminQuery, [loginInput, loginInput], async (adminErr, adminResults) => {
+    const adminQuery = 'SELECT * FROM admins WHERE email = ?';
+    db.query(adminQuery, [loginEmail], async (adminErr, adminResults) => {
       if (adminErr) return res.status(500).json({ success: false, message: 'Database error.' });
       if (adminResults.length === 0) return res.status(400).json({ success: false, message: 'Account not found.' });
 
@@ -405,10 +460,35 @@ app.post('/api/auth/login', (req, res) => {
 
 // --- 3. GET ALL STUDENTS ---
 app.get('/api/students', (req, res) => {
-  const query = "SELECT id, name, prn, email, phone, address, passout_year, tenth_marks, twelfth_marks, degree_marks, cmce_marks, ccee_marks, calls, calls_used, status, company, photo, created_at, 'student' AS role FROM students ORDER BY id DESC";
+  const query = `
+    SELECT s.id, s.name, s.prn, s.email, s.phone, s.address, s.passout_year,
+      s.tenth_marks, s.twelfth_marks, s.degree_marks, s.cmce_marks, s.ccee_marks,
+      s.calls, s.calls_used, s.status, s.company, s.photo, s.created_at,
+      'student' AS role,
+      (
+        SELECT GROUP_CONCAT(
+          DISTINCT CONCAT(d.company, ' - ', d.role)
+          ORDER BY d.company, d.role SEPARATOR '|||'
+        )
+        FROM drive_shortlists ds
+        INNER JOIN drives d ON d.id = ds.drive_id
+        WHERE ds.student_id = s.id
+      ) AS shortlisted_companies
+    FROM students s
+    ORDER BY s.id DESC
+  `;
   db.query(query, (err, results) => {
     if (err) return res.status(500).json({ success: false, message: 'Database error.' });
-    res.status(200).json({ success: true, count: results.length, students: results });
+    res.status(200).json({
+      success: true,
+      count: results.length,
+      students: results.map((student) => ({
+        ...student,
+        shortlisted_companies: student.shortlisted_companies
+          ? student.shortlisted_companies.split('|||')
+          : []
+      }))
+    });
   });
 });
 
@@ -452,10 +532,23 @@ app.get('/api/drives', (req, res) => {
 // --- 6. SHORTLISTING ENDPOINTS ---
 app.get('/api/drives/:driveId/shortlist', (req, res) => {
   const driveId = req.params.driveId;
-  db.query('SELECT student_id FROM drive_shortlists WHERE drive_id = ?', [driveId], (err, results) => {
-    if (err) return res.status(500).json({ success: false, message: err.message });
-    res.status(200).json({ success: true, shortlistedStudentIds: results.map((r) => r.student_id), records: results });
-  });
+  db.query(
+    `SELECT ds.student_id, s.name, s.prn, s.status
+     FROM drive_shortlists ds
+     INNER JOIN students s ON s.id = ds.student_id
+     WHERE ds.drive_id = ?
+     ORDER BY s.name`,
+    [driveId],
+    (err, results) => {
+      if (err) return res.status(500).json({ success: false, message: err.message });
+      res.status(200).json({
+        success: true,
+        shortlistedStudentIds: results.map((student) => student.student_id),
+        shortlistedStudents: results,
+        records: results.map(({ student_id }) => ({ student_id }))
+      });
+    }
+  );
 });
 
 app.post('/api/admin/drives/:driveId/shortlist', async (req, res) => {
@@ -472,6 +565,18 @@ app.post('/api/admin/drives/:driveId/shortlist', async (req, res) => {
     const [drive] = await runQuery(db, 'SELECT id FROM drives WHERE id = ?', [driveId]);
     if (!drive) return res.status(404).json({ success: false, message: 'Drive not found.' });
 
+    const previouslyShortlistedPlacedStudents = await runQuery(
+      db,
+      `SELECT ds.student_id
+       FROM drive_shortlists ds
+       INNER JOIN students s ON s.id = ds.student_id
+       WHERE ds.drive_id = ? AND LOWER(TRIM(s.status)) = 'placed'`,
+      [driveId]
+    );
+    const existingPlacedStudentIds = new Set(
+      previouslyShortlistedPlacedStudents.map(({ student_id }) => Number(student_id))
+    );
+
     if (studentIds.length > 0) {
       const selectedStudents = await runQuery(
         db,
@@ -479,7 +584,9 @@ app.post('/api/admin/drives/:driveId/shortlist', async (req, res) => {
         [studentIds.map(Number)]
       );
       const placedStudents = selectedStudents.filter(
-        (student) => String(student.status || '').trim().toLowerCase() === 'placed'
+        (student) =>
+          String(student.status || '').trim().toLowerCase() === 'placed' &&
+          !existingPlacedStudentIds.has(Number(student.id))
       );
       if (placedStudents.length > 0) {
         return res.status(400).json({
@@ -490,23 +597,20 @@ app.post('/api/admin/drives/:driveId/shortlist', async (req, res) => {
       }
     }
 
-    const previouslyShortlistedPlacedStudents = await runQuery(
-      db,
-      `SELECT ds.student_id
-       FROM drive_shortlists ds
-       INNER JOIN students s ON s.id = ds.student_id
-       WHERE ds.drive_id = ? AND LOWER(TRIM(s.status)) = 'placed'`,
-      [driveId]
-    );
-    const shortlistStudentIds = new Set([
-      ...previouslyShortlistedPlacedStudents.map(({ student_id }) => Number(student_id)),
+    const selectedIds = new Set([
+      ...existingPlacedStudentIds,
       ...studentIds.map(Number)
     ]);
 
     await runQuery(db, 'DELETE FROM drive_shortlists WHERE drive_id = ?', [driveId]);
-    if (shortlistStudentIds.size > 0) {
-      const values = [...shortlistStudentIds].map((studentId) => [driveId, studentId]);
+    if (selectedIds.size > 0) {
+      const values = [...selectedIds].map((studentId) => [driveId, studentId]);
       await runQuery(db, 'INSERT IGNORE INTO drive_shortlists (drive_id, student_id) VALUES ?', [values]);
+      await runQuery(
+        db,
+        'INSERT IGNORE INTO student_drive_calls (student_id, drive_id) VALUES ?',
+        [values.map(([shortlistedDriveId, studentId]) => [studentId, shortlistedDriveId])]
+      );
     }
     await runQuery(db, "UPDATE drives SET shortlist_mode = 'manual' WHERE id = ?", [driveId]);
 
@@ -528,7 +632,7 @@ app.get('/api/student/shortlisted-drives', (req, res) => {
     FROM drives d
     INNER JOIN drive_shortlists ds ON d.id = ds.drive_id
     INNER JOIN students s ON s.id = ds.student_id
-    WHERE LOWER(TRIM(s.status)) <> 'placed'
+    WHERE 1 = 1
   `;
   const params = [];
 
@@ -554,20 +658,37 @@ app.get('/api/student/shortlisted-drives', (req, res) => {
 app.post('/api/admin/students', async (req, res) => {
   const { name, prn, email, password, phone, address, passout_year, tenthMarks, twelfthMarks, degreeMarks, cmceMarks, cceeMarks, status, company, photo } = req.body;
   const marks = [tenthMarks, twelfthMarks, degreeMarks, cmceMarks, cceeMarks];
+  if ([name, prn, email, password, phone, status, ...marks].some((value) =>
+    value === null || value === undefined || String(value).trim() === ''
+  )) {
+    return res.status(400).json({ success: false, message: 'All student fields are required.' });
+  }
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ success: false, message: 'Enter a valid email address, such as name@domain.com.' });
+  }
+  if (!isValidPhone(phone)) {
+    return res.status(400).json({ success: false, message: 'Phone number must contain exactly 10 digits.' });
+  }
+  if (typeof password !== 'string' || password.length < 8) {
+    return res.status(400).json({ success: false, message: 'Password must be at least 8 characters long.' });
+  }
+  if (!['Unplaced', 'Placed'].includes(status)) {
+    return res.status(400).json({ success: false, message: 'Select a valid placement status.' });
+  }
   if (marks.some((mark) => !isValidPercentage(mark))) {
     return res.status(400).json({ success: false, message: 'Student marks must be percentages between 0 and 100.' });
   }
   try {
     const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password || 'student123', salt);
-    const studentEmail = email || `${prn.toLowerCase()}@cdac.in`;
+    const hashedPassword = await bcrypt.hash(password, salt);
+    const studentEmail = email.trim();
     const assignedCalls = calculateInitialCalls(cmceMarks, cceeMarks);
 
     const query = 'INSERT INTO students (name, prn, email, password, phone, address, passout_year, tenth_marks, twelfth_marks, degree_marks, cmce_marks, ccee_marks, calls, status, company, photo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)';
     db.query(query, [
-      name, prn, studentEmail, hashedPassword, phone || '', address || '', passout_year || 2026,
-      tenthMarks || '', twelfthMarks || '', degreeMarks || '', cmceMarks || '', cceeMarks || '',
-      assignedCalls, status || 'Unplaced', company || '-', photo || null
+      name, prn, studentEmail, hashedPassword, phone, address || '', passout_year || 2026,
+      tenthMarks, twelfthMarks, degreeMarks, cmceMarks, cceeMarks,
+      assignedCalls, status, company || '-', photo || null
     ], async (err) => {
       if (err) {
         if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ success: false, message: 'Student already exists.' });
@@ -730,6 +851,17 @@ app.put('/api/admin/drives/:id', async (req, res) => {
   if (validationError) return res.status(400).json({ success: false, message: validationError });
 
   try {
+    const [existingDrive] = await runQuery(
+      db,
+      'SELECT status, deadline_date FROM drives WHERE id = ?',
+      [req.params.id]
+    );
+    if (!existingDrive) return res.status(404).json({ success: false, message: 'Drive not found.' });
+    if (String(existingDrive.status).toLowerCase() === 'completed' ||
+      (existingDrive.deadline_date && existingDrive.deadline_date < getTodayInIndia())) {
+      return res.status(409).json({ success: false, message: 'Completed drives cannot be edited.' });
+    }
+
     const criteriaColumns = DRIVE_MARK_CRITERIA.map(({ driveField }) => driveField);
     const result = await runQuery(db, `
       UPDATE drives
@@ -816,11 +948,39 @@ app.post('/api/admin/create', async (req, res) => {
   }
 });
 
+app.delete('/api/admin/admins/:id', (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) {
+    return res.status(400).json({ success: false, message: 'Invalid admin ID.' });
+  }
+
+  db.query('DELETE FROM admins WHERE id = ?', [req.params.id], (err, result) => {
+    if (err) return res.status(500).json({ success: false, message: err.message });
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: 'Admin not found.' });
+    }
+    res.status(200).json({ success: true, message: 'Admin deleted successfully.' });
+  });
+});
+
 // --- 11. ADMIN: UPDATE STUDENT ---
 app.put('/api/admin/students/:id', (req, res) => {
   const studentId = req.params.id;
   const { name, prn, email, phone, address, status, company, tenth_marks, twelfth_marks, degree_marks, cmce_marks, ccee_marks, calls } = req.body;
   const marks = [tenth_marks, twelfth_marks, degree_marks, cmce_marks, ccee_marks];
+  if ([name, prn, email, phone, status, ...marks].some((value) =>
+    value === null || value === undefined || String(value).trim() === ''
+  )) {
+    return res.status(400).json({ success: false, message: 'All student fields are required.' });
+  }
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ success: false, message: 'Enter a valid email address, such as name@domain.com.' });
+  }
+  if (!isValidPhone(phone)) {
+    return res.status(400).json({ success: false, message: 'Phone number must contain exactly 10 digits.' });
+  }
+  if (!['Unplaced', 'Placed'].includes(status)) {
+    return res.status(400).json({ success: false, message: 'Select a valid placement status.' });
+  }
   if (marks.some((mark) => !isValidPercentage(mark))) {
     return res.status(400).json({ success: false, message: 'Student marks must be percentages between 0 and 100.' });
   }
@@ -858,12 +1018,22 @@ app.delete('/api/admin/drives/:id', (req, res) => {
       await new Promise((resolve, reject) => {
         connection.beginTransaction((err) => err ? reject(err) : resolve());
       });
-      const drives = await runQuery(connection, 'SELECT id FROM drives WHERE id = ?', [driveId]);
+      const drives = await runQuery(
+        connection,
+        'SELECT id, status, deadline_date FROM drives WHERE id = ?',
+        [driveId]
+      );
       if (drives.length === 0) {
         await new Promise((resolve) => connection.rollback(() => resolve()));
         return res.status(404).json({ success: false, message: 'Drive not found.' });
       }
+      if (String(drives[0].status).toLowerCase() === 'completed' ||
+        (drives[0].deadline_date && drives[0].deadline_date < getTodayInIndia())) {
+        await new Promise((resolve) => connection.rollback(() => resolve()));
+        return res.status(409).json({ success: false, message: 'Completed drives cannot be deleted.' });
+      }
       await runQuery(connection, 'DELETE FROM drive_shortlists WHERE drive_id = ?', [driveId]);
+      await runQuery(connection, 'DELETE FROM student_drive_calls WHERE drive_id = ?', [driveId]);
       await runQuery(connection, 'DELETE FROM drives WHERE id = ?', [driveId]);
       await runQuery(connection, `
         UPDATE students s
