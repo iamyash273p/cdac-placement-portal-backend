@@ -923,6 +923,20 @@ app.post('/api/admin/create', async (req, res) => {
   }
 });
 
+app.delete('/api/admin/admins/:id', (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) {
+    return res.status(400).json({ success: false, message: 'Invalid admin ID.' });
+  }
+
+  db.query('DELETE FROM admins WHERE id = ?', [req.params.id], (err, result) => {
+    if (err) return res.status(500).json({ success: false, message: err.message });
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: 'Admin not found.' });
+    }
+    res.status(200).json({ success: true, message: 'Admin deleted successfully.' });
+  });
+});
+
 // --- 11. ADMIN: UPDATE STUDENT ---
 app.put('/api/admin/students/:id', (req, res) => {
   const studentId = req.params.id;
