@@ -56,6 +56,14 @@ function isValidPercentage(value) {
   return Number.isFinite(mark) && mark >= 0 && mark <= 100;
 }
 
+function isValidEmail(value) {
+  return typeof value === 'string' && /^[^\s@]+@[^\s@]+\.[A-Za-z]{2,}$/.test(value.trim());
+}
+
+function isValidPhone(value) {
+  return /^\d{10}$/.test(String(value ?? ''));
+}
+
 function studentMeetsDriveCriteria(student, drive) {
   if (String(student.status || '').trim().toLowerCase() === 'placed') return false;
 
@@ -407,17 +415,17 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// --- 2. LOGIN ENDPOINT (Supports both identifier & email/prn fields) ---
+// --- 2. LOGIN ENDPOINT ---
 app.post('/api/auth/login', (req, res) => {
-  const { identifier, email, prn, password } = req.body;
-  const loginInput = (identifier || email || prn || '').trim();
+  const { email, password } = req.body;
+  const loginEmail = typeof email === 'string' ? email.trim() : '';
 
-  if (!loginInput || !password) {
-    return res.status(400).json({ success: false, message: 'Email/PRN and password are required.' });
+  if (!loginEmail || !password) {
+    return res.status(400).json({ success: false, message: 'Email and password are required.' });
   }
 
-  const studentQuery = 'SELECT * FROM students WHERE email = ? OR prn = ?';
-  db.query(studentQuery, [loginInput, loginInput], async (err, results) => {
+  const studentQuery = 'SELECT * FROM students WHERE email = ?';
+  db.query(studentQuery, [loginEmail], async (err, results) => {
     if (err) return res.status(500).json({ success: false, message: 'Database error.' });
 
     if (results.length > 0) {
@@ -432,8 +440,8 @@ app.post('/api/auth/login', (req, res) => {
       });
     }
 
-    const adminQuery = 'SELECT * FROM admins WHERE email = ? OR name = ?';
-    db.query(adminQuery, [loginInput, loginInput], async (adminErr, adminResults) => {
+    const adminQuery = 'SELECT * FROM admins WHERE email = ?';
+    db.query(adminQuery, [loginEmail], async (adminErr, adminResults) => {
       if (adminErr) return res.status(500).json({ success: false, message: 'Database error.' });
       if (adminResults.length === 0) return res.status(400).json({ success: false, message: 'Account not found.' });
 
@@ -650,20 +658,37 @@ app.get('/api/student/shortlisted-drives', (req, res) => {
 app.post('/api/admin/students', async (req, res) => {
   const { name, prn, email, password, phone, address, passout_year, tenthMarks, twelfthMarks, degreeMarks, cmceMarks, cceeMarks, status, company, photo } = req.body;
   const marks = [tenthMarks, twelfthMarks, degreeMarks, cmceMarks, cceeMarks];
+  if ([name, prn, email, password, phone, status, ...marks].some((value) =>
+    value === null || value === undefined || String(value).trim() === ''
+  )) {
+    return res.status(400).json({ success: false, message: 'All student fields are required.' });
+  }
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ success: false, message: 'Enter a valid email address, such as name@domain.com.' });
+  }
+  if (!isValidPhone(phone)) {
+    return res.status(400).json({ success: false, message: 'Phone number must contain exactly 10 digits.' });
+  }
+  if (typeof password !== 'string' || password.length < 8) {
+    return res.status(400).json({ success: false, message: 'Password must be at least 8 characters long.' });
+  }
+  if (!['Unplaced', 'Placed'].includes(status)) {
+    return res.status(400).json({ success: false, message: 'Select a valid placement status.' });
+  }
   if (marks.some((mark) => !isValidPercentage(mark))) {
     return res.status(400).json({ success: false, message: 'Student marks must be percentages between 0 and 100.' });
   }
   try {
     const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password || 'student123', salt);
-    const studentEmail = email || `${prn.toLowerCase()}@cdac.in`;
+    const hashedPassword = await bcrypt.hash(password, salt);
+    const studentEmail = email.trim();
     const assignedCalls = calculateInitialCalls(cmceMarks, cceeMarks);
 
     const query = 'INSERT INTO students (name, prn, email, password, phone, address, passout_year, tenth_marks, twelfth_marks, degree_marks, cmce_marks, ccee_marks, calls, status, company, photo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)';
     db.query(query, [
-      name, prn, studentEmail, hashedPassword, phone || '', address || '', passout_year || 2026,
-      tenthMarks || '', twelfthMarks || '', degreeMarks || '', cmceMarks || '', cceeMarks || '',
-      assignedCalls, status || 'Unplaced', company || '-', photo || null
+      name, prn, studentEmail, hashedPassword, phone, address || '', passout_year || 2026,
+      tenthMarks, twelfthMarks, degreeMarks, cmceMarks, cceeMarks,
+      assignedCalls, status, company || '-', photo || null
     ], async (err) => {
       if (err) {
         if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ success: false, message: 'Student already exists.' });
@@ -942,6 +967,20 @@ app.put('/api/admin/students/:id', (req, res) => {
   const studentId = req.params.id;
   const { name, prn, email, phone, address, status, company, tenth_marks, twelfth_marks, degree_marks, cmce_marks, ccee_marks, calls } = req.body;
   const marks = [tenth_marks, twelfth_marks, degree_marks, cmce_marks, ccee_marks];
+  if ([name, prn, email, phone, status, ...marks].some((value) =>
+    value === null || value === undefined || String(value).trim() === ''
+  )) {
+    return res.status(400).json({ success: false, message: 'All student fields are required.' });
+  }
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ success: false, message: 'Enter a valid email address, such as name@domain.com.' });
+  }
+  if (!isValidPhone(phone)) {
+    return res.status(400).json({ success: false, message: 'Phone number must contain exactly 10 digits.' });
+  }
+  if (!['Unplaced', 'Placed'].includes(status)) {
+    return res.status(400).json({ success: false, message: 'Select a valid placement status.' });
+  }
   if (marks.some((mark) => !isValidPercentage(mark))) {
     return res.status(400).json({ success: false, message: 'Student marks must be percentages between 0 and 100.' });
   }
